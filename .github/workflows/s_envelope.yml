@@ -1,0 +1,99 @@
+name: S엔벨롭 장중 데이터 갱신 → S_envelope
+# (2026-11-26 이전: S_envelope/.github/workflows/update.yml) cron-job.org 가 평일 09:05~15:05 매시 5분(정시 모드)과 15:38(마감 모드)에 dispatch 한다. body {"ref":"main"}
+# 순서: kospi.yml(지수 판정, 매시 :00 · 15:33) → update.yml(:05). 시작할 때 kospi.yml 실행이 끝날 때까지 기다린 뒤
+#       최신 kospi/kospi_alert_state.json 을 받아 S 감시·모의투자·보고에 쓴다(지수저점 단일 기준, kospi/cycles.py).
+# mode=auto: KST 15:30 전 → hourly, 15:30 이후 → close. sync = 페이지의 🔄 수동 동기화(텔레그램 없음).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'auto / hourly / close / sync'
+        required: false
+        default: 'auto'
+        type: choice
+        options: [auto, hourly, close, sync]
+      notify: { description: 'notify.py 옵션 (--dry 미리보기 / --test / --force)', required: false, default: '' }
+concurrency: { group: s-update, cancel-in-progress: false }
+permissions: { contents: read, actions: read }   # 쓰기는 PRIVATE_REPO_TOKEN 으로 S_envelope 에
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: chany2m4655/S_envelope   # 비공개 저장소 (코드·데이터·상태는 그대로 거기 있음)
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install requests
+      - name: 코스피 지수 판정(kospi.yml) 끝날 때까지 대기 → 최신 phase 받기
+        env: { GH_TOKEN: '${{ github.token }}', REPO: '${{ github.repository }}' }
+        run: |
+          for i in $(seq 1 40); do
+            n=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/actions/workflows/kospi.yml/runs?per_page=10" \
+              | python -c "import sys,json;print(sum(r['status'] in ('queued','in_progress','waiting','pending','requested') for r in json.load(sys.stdin).get('workflow_runs',[])))" || echo 0)
+            [ "$n" = "0" ] && break
+            echo "kospi.yml 실행 중($n) → 15초 대기"; sleep 15
+          done
+          git pull -q --rebase origin main || git pull -q origin main || true
+          python -c "import json;s=json.load(open('kospi/kospi_alert_state.json'));print('phase',s.get('phase'),'last_check',s.get('last_check'),'exit',s.get('exit_date'),s.get('exit_time'))"
+      - name: 모드 결정
+        env: { IN_MODE: '${{ inputs.mode }}' }
+        run: |
+          M="${IN_MODE:-auto}"
+          if [ "$M" = "auto" ] || [ -z "$M" ]; then
+            HM=$(TZ=Asia/Seoul date +%H%M)
+            if [ "$HM" -ge 1530 ]; then M=close; else M=hourly; fi
+          fi
+          case "$M" in
+            hourly) SLOTS=09:05,10:05,11:05,12:05,13:05,14:05,15:05 ;;
+            close)  SLOTS=15:40 ;;
+            *)      M=sync; SLOTS= ;;
+          esac
+          echo "MODE=$M" >> "$GITHUB_ENV"; echo "SLOTS=$SLOTS" >> "$GITHUB_ENV"
+          echo "mode=$M slots=$SLOTS (KST $(TZ=Asia/Seoul date +%H:%M))"
+      - run: ./build.sh
+      - run: python inline.py
+      - name: Cloudflare Pages 배포 (s-envelope.pages.dev)
+        id: cf
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "::error::secret CLOUDFLARE_API_TOKEN 이 없습니다"; exit 1; fi
+          # functions/ (네이버 1분봉 프록시) 는 저장소 루트에서 실행해야 함께 배포됨
+          npx -y wrangler@4 pages deploy dist --project-name s-envelope --branch main --commit-dirty=true
+      - name: 보고 시각까지 대기
+        if: ${{ env.MODE != 'sync' }}
+        env: { FORCE_REPORT: '${{ inputs.notify }}' }
+        run: python wait_report.py "$SLOTS" 5
+      - name: 아침 코스피 보고 먼저 (09시대 첫 보고 전, 지수저점일 때 · 09:30 hold 는 중복 안 보냄)
+        if: ${{ env.MODE == 'hourly' && env.SKIP_REPORT != '1' && inputs.notify == '' }}
+        env: { TELEGRAM_TOKEN: '${{ secrets.TELEGRAM_TOKEN }}', TELEGRAM_CHAT_ID: '${{ secrets.TELEGRAM_CHAT_ID }}', HOLD_EARLY: '1' }
+        run: |
+          [ "$(TZ=Asia/Seoul date +%H)" = "09" ] || { echo "09시대 아님 → 건너뜀"; exit 0; }
+          python kospi/kospi_alert.py hold || true
+      - name: 텔레그램 S엔벨롭 보고
+        if: ${{ env.MODE != 'sync' && env.SKIP_REPORT != '1' }}
+        env: { TELEGRAM_TOKEN: '${{ secrets.TELEGRAM_TOKEN }}', TELEGRAM_CHAT_ID: '${{ secrets.TELEGRAM_CHAT_ID }}', NOTIFY_OPT: '${{ inputs.notify }}' }
+        run: python notify.py --mode "$MODE" $NOTIFY_OPT || true
+      - name: 데이터 커밋 (분봉 아카이브는 마감 때만)
+        if: ${{ env.MODE != 'sync' }}
+        run: |
+          git config user.name "s-envelope-bot"; git config user.email "actions@users.noreply.github.com"
+          if [ "$MODE" = "close" ]; then
+            git add screener/minute_archive screener/*.json state/*.json || true
+          else
+            git add state/*.json || true
+          fi
+          git add kospi/kospi_alert_state.json kospi/db/ 2>/dev/null || true   # 아침 코스피 보고(hold) 상태
+          git commit -m "$MODE data $(TZ=Asia/Seoul date +'%m/%d %H:%M')" || echo "no changes"
+          git reset -q --hard HEAD   # 커밋 안 하는 산출물 버림 (배포는 이미 끝남)
+          for i in 1 2 3; do
+            git pull --rebase -X ours && git push && exit 0
+            sleep 5
+          done
+          echo "push 실패(3회)"; exit 0

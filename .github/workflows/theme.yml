@@ -1,0 +1,75 @@
+name: 테마주·주도주 갱신 (AI 없음) → theme_stock
+run-name: "갱신 ${{ inputs.part || 'deploy' }} ${{ inputs.date || '오늘' }}${{ inputs.notify == 'false' && ' (알림 없음)' || '' }}"
+on:
+  workflow_dispatch:
+    inputs:
+      part: { description: 'theme / leader / all / deploy(수집 없이 배포만)', default: 'deploy' }
+      date: { description: '분석 날짜 YYYY-MM-DD (비우면 오늘). 범위 A..B, 목록 A,B 가능. 날짜 지정 실행은 텔레그램 안 보냄', default: '', required: false }
+      notify: { description: '텔레그램 보고 (true/false)', default: 'true', required: false }
+concurrency: { group: theme-update, cancel-in-progress: false }
+permissions: { contents: read }   # 쓰기는 PRIVATE_REPO_TOKEN 으로 theme_stock 에
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: chany2m4655/theme_stock  # 비공개 저장소 (코드·데이터·상태는 그대로 거기 있음)
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: 실행
+        env:
+          IN_PART: ${{ inputs.part }}
+          IN_DATE: ${{ inputs.date }}
+          IN_NOTIFY: ${{ inputs.notify }}
+        run: |
+          PART="$IN_PART"
+          if [ -z "$PART" ]; then
+            H=$(TZ=Asia/Seoul date +%H)
+            if [ "$H" -ge 20 ]; then PART=leader; else PART=theme; fi
+          fi
+          DATE="$(echo "$IN_DATE" | tr -d ' ')"
+          NOTIFY="${IN_NOTIFY:-true}"
+          if [ -n "$DATE" ]; then NOTIFY=false; fi   # 날짜 지정(백필·페이지 버튼) 실행은 텔레그램 안 보냄
+          echo "PART=$PART" >> $GITHUB_ENV
+          echo "NOTIFY=$NOTIFY" >> $GITHUB_ENV
+          if [ "$PART" != "deploy" ]; then
+            if [ -n "$DATE" ]; then
+              python daily_monitor.py --part=$PART --date="$DATE" > /tmp/msg.txt || true
+            else
+              python daily_monitor.py --part=$PART > /tmp/msg.txt || true
+            fi
+            echo "보고 메시지 $(wc -l < /tmp/msg.txt)줄"
+          fi
+          python build_index.py
+          python d_sim.py || echo 'd_sim 실패'
+          timeout 300 python realsim.py dtheme data/dsim/real_theme.json data/dsim/realsim_state_theme.json || echo '테마주 실전모의 실패'
+          timeout 300 python realsim.py dleader data/dsim/real_leader.json data/dsim/realsim_state_leader.json || echo '주도주 실전모의 실패'
+      - name: 데이터 커밋
+        env: { IN_DATE: '${{ inputs.date }}' }
+        run: |
+          git config user.name "theme-calendar-bot"; git config user.email "actions@users.noreply.github.com"
+          git add data || true
+          git commit -m "data $(TZ=Asia/Seoul date +'%m/%d %H:%M') ${PART} ${IN_DATE}" || echo "no changes"
+          git pull --rebase -X ours && git push || true
+      - name: Cloudflare Pages 배포 (theme-stock.pages.dev)
+        id: cf
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then echo "::error::secret CLOUDFLARE_API_TOKEN 이 없습니다"; exit 1; fi
+          rm -rf /tmp/site && mkdir -p /tmp/site && rsync -a --exclude .git --exclude .github --exclude functions ./ /tmp/site/
+          npx -y wrangler@4 pages deploy /tmp/site --project-name theme-stock --branch main --commit-dirty=true
+      - name: 보고 시각까지 대기
+        if: ${{ env.PART != 'deploy' && env.NOTIFY == 'true' }}
+        run: python wait_report.py 17:35,20:15 10
+      - name: 텔레그램 보고
+        if: ${{ env.PART != 'deploy' && env.NOTIFY == 'true' && env.SKIP_REPORT != '1' }}
+        env: { TELEGRAM_TOKEN: '${{ secrets.TELEGRAM_TOKEN }}', TELEGRAM_CHAT_ID: '${{ secrets.TELEGRAM_CHAT_ID }}' }
+        run: |
+          if [ "$PART" = "leader" ]; then N=주도주; elif [ "$PART" = "all" ]; then N=테마주·주도주; else N=테마주; fi
+          [ -s /tmp/msg.txt ] && { cat /tmp/msg.txt; printf '\n\n올스토커 · 테마주·주도주\nhttps://allstocker.pages.dev/#theme\n'; } | python tg_send.py "$N" || true

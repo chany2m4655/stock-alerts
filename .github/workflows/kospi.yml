@@ -1,0 +1,68 @@
+name: 코스피 지수저점 알림 (AI 없음) → S_envelope
+run-name: "코스피 ${{ inputs.mode || 'hourly' }}${{ inputs.notify == 'false' && ' (dry-run)' || '' }}"
+on:
+  workflow_dispatch:
+    inputs:
+      mode: { description: 'hourly(매시 이벤트 감시) / hold(09:30 지수저점유지)', default: 'hourly' }
+      notify: { description: '텔레그램 전송·상태 저장 (true/false=dry-run)', default: 'true', required: false }
+      force: { description: '시간대·간격·지각 판정 무시 (테스트용)', default: 'false', required: false }
+      s_test: { description: 'dry-run 전용: S 연동 강제 시험 (low_entry / low_exit / 빈칸)', default: '', required: false }
+# 일정(cron-job.org, KST 평일): hourly = 08:00~20:00 매시 정각(:00) + 15:33(종가 3분봉 판정) · hold = 09:30
+# update.yml(S 감시)은 매시 :05 에 돌고, 시작할 때 이 워크플로가 끝날 때까지 기다린 뒤 이 상태 파일을 읽는다(단일 기준).
+concurrency: { group: kospi, cancel-in-progress: false }
+permissions: { contents: read }   # 쓰기는 PRIVATE_REPO_TOKEN 으로 S_envelope 에
+jobs:
+  kospi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: chany2m4655/S_envelope   # 비공개 저장소 (코드·데이터·상태는 그대로 거기 있음)
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: 실행
+        env:
+          MODE: ${{ inputs.mode || 'hourly' }}
+          NOTIFY: ${{ inputs.notify || 'true' }}
+          FORCE: ${{ inputs.force || 'false' }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "import json;print(json.load(open('kospi/kospi_alert_state.json')).get('phase',''))" > /tmp/phase_before || echo "" > /tmp/phase_before
+          python kospi/kospi_alert.py "$MODE"
+      - name: phase 전환 → S 감시 연동 (진입=S 리스트 전체 / 벗어남=S 감시 종료)
+        if: ${{ always() }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NOTIFY: ${{ inputs.notify || 'true' }}
+          S_TEST: ${{ inputs.s_test || '' }}
+        run: |
+          B=$(cat /tmp/phase_before); A=$(python -c "import json;print(json.load(open('kospi/kospi_alert_state.json')).get('phase',''))")
+          echo "phase $B → $A (notify=$NOTIFY s_test=$S_TEST)"
+          DRY=""; export KOSPI_STATE=kospi/kospi_alert_state.json
+          if [ "$NOTIFY" != "true" ]; then
+            DRY="--dry"
+            # dry-run 에서는 상태 파일이 저장되지 않으므로 s_test 로 전환을 흉내 낸다 (텔레그램 전송 없음)
+            if [ "$S_TEST" = "low_entry" ]; then
+              python -c "import json;s=json.load(open('kospi/kospi_alert_state.json'));s.update(phase='low',low_date=s.get('low_date') or '2026-10-08',low_time=s.get('low_time') or '15:30');json.dump(s,open('/tmp/st_test.json','w'))"
+              B=idle; A=low; export KOSPI_STATE=/tmp/st_test.json
+            elif [ "$S_TEST" = "low_exit" ]; then
+              B=low; A=idle
+            fi
+          fi
+          [ "$B" != "$A" ] && pip install -q requests
+          python kospi/s_link.py "$B" "$A" $DRY || echo "S 연동 실패"
+      - name: 상태 커밋
+        if: ${{ always() && (inputs.notify || 'true') == 'true' }}
+        run: |
+          git config user.name "kospi-alert-bot"; git config user.email "actions@users.noreply.github.com"
+          git add kospi/kospi_alert_state.json kospi/kospi_chart.json kospi/db/ state/s_watch_state.json state/notify_state.json screener/s_watch.json 2>/dev/null || git add kospi/kospi_alert_state.json
+          git commit -m "kospi state $(TZ=Asia/Seoul date +'%m/%d %H:%M')" || { echo "no changes"; exit 0; }
+          for i in 1 2 3; do
+            git pull --rebase -X theirs && git push && exit 0
+            sleep 5
+          done
+          exit 1
